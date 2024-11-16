@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -12,13 +13,14 @@ import (
 )
 
 const (
-	RouteGetIndex           = "/"
+	RouteGetCotacao         = "/cotacao"
 	ExchageProviderUrl      = "https://economia.awesomeapi.com.br/json/last/USD-BRL"
-	ExchangeProviderTimeout = 15 * time.Second
+	ExchangeProviderTimeout = 200 * time.Millisecond
+	DatabaseInsertTimeout   = 10 * time.Millisecond
 )
 
 type ExchangeProvider interface {
-	Execute(ctx context.Context) (utils.GetExchangeResponse, error)
+	Execute(ctx context.Context) (Cotation, error)
 }
 
 type HttpHandler interface {
@@ -26,27 +28,39 @@ type HttpHandler interface {
 }
 
 type conversionHandler struct {
+	repository       DatabaseRepository
 	exchangeProvider ExchangeProvider
 }
 
+type GetExchangeResponse struct {
+	USDBRL Cotation `json:"USDBRL"`
+}
+
 // NewConversionHandler
-func NewConversionHandler() HttpHandler {
+func NewConversionHandler(repo DatabaseRepository) HttpHandler {
 	return &conversionHandler{
+		repository:       repo,
 		exchangeProvider: NewExchangeProvider(),
 	}
 }
 
 // Index
 func (h *conversionHandler) Index(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), ExchangeProviderTimeout)
-	defer cancel()
-
-	data, err := h.exchangeProvider.Execute(ctx)
+	cotationResult, err := h.exchangeProvider.Execute(r.Context())
 	if err != nil {
-		log.Fatalf("error: %v", err)
+
+		log.Default().Printf("error while trying to call exchange provider to execute conversion.", err)
+		utils.JsonResponse(w, nil, http.StatusExpectationFailed)
+		return
 	}
 
-	utils.JsonResponse(w, data.USDBRL, http.StatusOK)
+	if _, err := h.repository.Insert(r.Context(), cotationResult); err != nil {
+		log.Default().Printf("error while trying to insert data into the database.", err)
+		utils.JsonResponse(w, nil, http.StatusInternalServerError)
+		return
+	}
+
+	utils.JsonResponse(w, cotationResult, http.StatusOK)
 }
 
 // exchangeProvider
@@ -57,39 +71,68 @@ func NewExchangeProvider() ExchangeProvider {
 	return &exchangeProvider{}
 }
 
-// Execute
-func (h *exchangeProvider) Execute(ctx context.Context) (utils.GetExchangeResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ExchageProviderUrl, nil)
+// formatCotationResonse
+func (h *exchangeProvider) formatCotationResonse(body io.Reader) (Cotation, error) {
+	log.Default().Println("======================")
+	byteBody, err := io.ReadAll(body)
 	if err != nil {
-		return utils.GetExchangeResponse{}, err
+		return Cotation{}, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return utils.GetExchangeResponse{}, err
-	}
-	defer resp.Body.Close()
-
-	byteBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return utils.GetExchangeResponse{}, err
-	}
-
-	var result utils.GetExchangeResponse
+	var result GetExchangeResponse
 	err = json.Unmarshal(byteBody, &result)
 	if err != nil {
-		return utils.GetExchangeResponse{}, err
+		log.Default().Printf("error while trying to Unmarshal response body", err)
+		return Cotation{}, err
 	}
 
-	// fmt.Println(result)
+	return result.USDBRL, nil
+}
 
-	return result, err
-	// io.Copy(os.Stdout, resp.Body)
+// Execute
+func (h *exchangeProvider) Execute(ctx context.Context) (Cotation, error) {
+	ctx, cancel := context.WithTimeout(ctx, ExchangeProviderTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ExchageProviderUrl, nil)
+	if err != nil {
+		return Cotation{}, err
+	}
+
+	apiResponse := make(chan *http.Response)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Default().Printf("error while executing http request.", err)
+			return
+		}
+
+		apiResponse <- resp
+	}()
+
+	select {
+	case result := <-apiResponse:
+		defer result.Body.Close()
+		return h.formatCotationResonse(result.Body)
+	case <-ctx.Done():
+		log.Default().Printf("ctx done. it was canceled or timed out.", ctx.Err())
+		return Cotation{}, errors.New("error: ctx done. it was canceled or timed out.")
+	}
 }
 
 func main() {
-	handler := NewConversionHandler()
-	http.HandleFunc(RouteGetIndex, handler.Index)
-	http.ListenAndServe(":8808", nil)
+	conn, err := GetDBConnection()
+	if err != nil {
+		log.Fatalf("error while trying to create a database connection. %v", err)
+	}
+
+	repo, err := NewSqliteRepository(conn)
+	if err != nil {
+		log.Fatalf("error while trying to create sqlLite connection", err)
+	}
+
+	handler := NewConversionHandler(repo)
+	http.HandleFunc(RouteGetCotacao, handler.Index)
+	http.ListenAndServe(":8080", nil)
 
 }
