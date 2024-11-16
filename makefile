@@ -7,12 +7,12 @@ default: run-with-docs
 
 dev:
 	@air 
-run-with-docs:
+run-server:
 	@swag init -g cmd/main.go
 	@go run cmd/main.go
-build:
-	@go build -o $(APP_NAME) cmd/main.go
+run-client:
+
+build-server:
+	@go build -o $(APP_NAME) cmd/server/main.go
 test:
-	@go test ./ ...
-docs:
-	sh ./scripts/generate_swagger_docs.sh
+	@go test ./... -cover
